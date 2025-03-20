@@ -23,25 +23,36 @@ for file in csv_files:
         continue
 
     # Zero point correction
-    baseline1 = df["Stress(Pascal)"].iloc[0]
-    df["Stress(Pascal)"] = df["Stress(Pascal)"] - baseline1
-    baseline2 = df["Stress(kPa)"].iloc[0]
-    df["Stress(kPa)"] = df["Stress(kPa)"] - baseline2
+    # baseline1 = df["Stress(Pascal)"].iloc[0]
+    # df["Stress(Pascal)"] = df["Stress(Pascal)"] - baseline1
+    # baseline2 = df["Stress(kPa)"].iloc[0]
+    # df["Stress(kPa)"] = df["Stress(kPa)"] - baseline2
     # Eliminate negative value
-    df = df[df["Force_N"] > 0]
+    # df = df[df["Force_N"] > 0]
 
     # Get sample infomation from file name
     basename = os.path.basename(file)
-    if "1-0" in basename:
-        ratio_num = 0.0
-    elif "1-0.25" in basename:
-        ratio_num = 0.25
-    elif "1-0.5" in basename:
-        ratio_num = 0.5
-    elif "1-1" in basename:
-        ratio_num = 1.0
+    if "1-1-0" in basename:
+        cd_ratio = 0.0
+        pei_ratio = 1.0
+    elif "1-1-0.25" in basename:
+        cd_ratio = 0.25
+        pei_ratio = 1.0
+    elif "1-1-0.5" in basename:
+        cd_ratio = 0.5
+        pei_ratio = 1.0
+    elif "1-1-1" in basename:
+        cd_ratio = 1.0
+        pei_ratio = 1.0
+    elif "1-2-0" in basename:
+        cd_ratio = 0.0
+        pei_ratio = 2.0
+    elif "1-3-1" in basename:
+        cd_ratio = 0.0
+        pei_ratio = 3.0
     else:
-        ratio_num = np.nan
+        cd_ratio = np.nan
+        pei_ratio = np.nan
 
     if "beta" in basename.lower():
         cd_type = "β-CD"
@@ -51,7 +62,8 @@ for file in csv_files:
         cd_type = "unknown"
 
     # Add sample information to new columns
-    df["PVA_CD_ratio"] = ratio_num
+    df["CD_ratio"] = cd_ratio
+    df["PEI_ratio"] = pei_ratio
     df["CD_type"] = cd_type
     df["Sample_ID"] = basename
 
@@ -84,13 +96,15 @@ def extract_features(df_sample):
     energy_absorption = np.trapz(df_sample["Stress(kPa)"], df_sample["Strain"])
 
     # Sample Information
-    ratio = df_sample["PVA_CD_ratio"].iloc[0]
+    cd_ratio = df_sample["CD_ratio"].iloc[0]
+    pei_ratio = df_sample["PEI_ratio"].iloc[0]
     cd_type = df_sample["CD_type"].iloc[0]
     sample_id = df_sample["Sample_ID"].iloc[0]
 
     return pd.Series({
         "Sample_ID": sample_id,
-        "PVA_CD_ratio": ratio,
+        "CD_ratio": cd_ratio,
+        "PEI_ratio": pei_ratio,
         "CD_type": cd_type,
         "max_stress": max_stress,
         "max_strain": max_strain,
@@ -102,17 +116,18 @@ def extract_features(df_sample):
 # Group by sample (Sample_ID) and extract features
 features_df = all_data.groupby("Sample_ID").apply(
     extract_features).reset_index(drop=True)
+# Drop rows with missing values in critical features
+features_df = features_df.dropna(
+    subset=["CD_ratio", "PEI_ratio", "CD_type", "E_modulus"])
 
 
 # --- Step 3: Build Models ---
 
 features_df["CD_type_num"] = features_df["CD_type"].map({"β-CD": 0, "γ-CD": 1})
+features_df["robustness"] = features_df["max_stress"]
 
-# Set explanatory variables and objective variables
-# Explanatory variables: PVA_CD_ratio, CD_type_num, E_modulus
-# Objective variable: Robustness defined as max_stress * max_strain
-x = features_df[["PVA_CD_ratio", "CD_type_num", "E_modulus"]]
-y = features_df["max_stress"] * features_df["max_strain"]
+x = features_df[["PEI_ratio", "CD_ratio", "CD_type_num", "E_modulus"]]
+y = features_df["robustness"]
 
 # Split into training and testing (80% training, 20% testing)
 x_train, x_test, y_train, y_test = train_test_split(
@@ -140,72 +155,63 @@ print("  R^2:", r2_score(y_test, y_pred_gb))
 
 # --- Step 4: Optimization and trade-off analysis ---
 
-# To evaluate the predicted maximum stresses at varying PVA/CD ratios for each CD type here,
-# average E_modulus and energy_absorption (averaged over all samples) as representative values.
 mean_E_modulus = features_df["E_modulus"].mean()
 
 
-def predict_robustness(model, ratio, cd_type_num, mean_E_modulus):
-    x_query = pd.DataFrame([[ratio, cd_type_num, mean_E_modulus]], columns=[
-                           "PVA_CD_ratio", "CD_type_num", "E_modulus"])
+def predict_robustness(model, pei_ratio, cd_ratio, cd_type_num, E_modulus):
+    x_query = pd.DataFrame([[pei_ratio, cd_ratio, cd_type_num, E_modulus]], columns=[
+                           "PEI_ratio", "CD_ratio", "CD_type_num", "E_modulus"])
     return model.predict(x_query)[0]
 
 
-min_ratio = features_df.loc[features_df["PVA_CD_ratio"]
-                            > 0, "PVA_CD_ratio"].min()
-# Use candidate ratios by interpolating between the unique experimental values observed (excluding 0)
-unique_ratios = np.sort(features_df["PVA_CD_ratio"].unique())
-interpolated_candidates = []
-for i in range(len(unique_ratios) - 1):
-    # Generate 20 evenly-spaced values between each pair of adjacent unique ratios (excluding the upper bound)
-    segment = np.linspace(
-        unique_ratios[i], unique_ratios[i+1], 20, endpoint=False)
-    interpolated_candidates.extend(segment)
-# Append the last unique ratio
-interpolated_candidates.append(unique_ratios[-1])
-# Convert to a NumPy array and sort
-ratio_candidates = np.array(sorted(interpolated_candidates))
+# Define candidate CD ratios uniformly in the range [0, 1]
+ratio_candidates = np.linspace(0, 1, 101)
 print("Candidate PVA/CD Ratios:", ratio_candidates)
-
-# To avoid extreme values (0 or 1), introduce a penalty term to favor intermediate ratios.
-# Define target ratio as the midpoint between the minimum experimental ratio and maximum candidate.
-max_ratio_val = ratio_candidates[-1]
-target_ratio = (min_ratio + max_ratio_val) / 2
-lambda_penalty = 0.2  # Adjust this penalty parameter as needed
+# Define candidate PEI ratios uniformly between the minimum and maximum observed values.
+pei_candidates = np.linspace(
+    features_df["PEI_ratio"].min(), features_df["PEI_ratio"].max(), 101)
+print("Candidate PEI Ratios:", pei_candidates)
 
 optimal_results = {}
 for cd_type_num, cd_label in zip([0, 1], ["β-CD", "γ-CD"]):
-    # Compute mean E_modulus separately for each CD type to better capture their differences.
+    # Compute mean E_modulus separately for each CD type.
     mean_E_modulus_cd = features_df.loc[features_df["CD_type_num"]
                                         == cd_type_num, "E_modulus"].mean()
-    composite_objs = [predict_robustness(grid_gb.best_estimator_, r, cd_type_num, mean_E_modulus_cd)
-                      - lambda_penalty * (r - target_ratio) ** 2
-                      for r in ratio_candidates]
-    best_idx = np.argmax(composite_objs)
-    best_ratio = ratio_candidates[best_idx]
-    best_pred = predict_robustness(
-        grid_gb.best_estimator_, best_ratio, cd_type_num, mean_E_modulus_cd)
-
+    best_obj = -np.inf
+    best_cd_ratio = None
+    best_pei_ratio = None
+    # Optimize over both CD ratio and PEI ratio (with fixed PVA = 1).
+    for cd_val in ratio_candidates:
+        for pei_val in pei_candidates:
+            obj = predict_robustness(
+                grid_gb.best_estimator_, pei_val, cd_val, cd_type_num, mean_E_modulus_cd)
+            if obj > best_obj:
+                best_obj = obj
+                best_cd_ratio = cd_val
+                best_pei_ratio = pei_val
     optimal_results[cd_label] = {
-        "optimal_ratio": best_ratio, "predicted_robustness": best_pred}
-    plt.plot(ratio_candidates, composite_objs, label=cd_label)
+        "optimal_pei_ratio": best_pei_ratio,
+        "optimal_cd_ratio": best_cd_ratio,
+        "predicted_robustness": best_obj}
+    plt.plot(ratio_candidates, [predict_robustness(grid_gb.best_estimator_, best_pei_ratio, cd, cd_type_num, mean_E_modulus_cd) for cd in ratio_candidates],
+             label=f"{cd_label} (PEI={best_pei_ratio:.2f})")
 
-plt.xlabel("PVA/CD Ratio")
+plt.xlabel("PEI/CD Ratio")
 plt.ylabel("Predicted Robustness")
-plt.title("PVA/CD Ratio and Predicted Maximum Stress by CD Type")
+plt.title("PEI/CD Ratio and Predicted Maximum Stress by CD Type")
 plt.legend()
 plt.show(block=False)
 
 print("Optimization Result:")
 for cd_label, result in optimal_results.items():
-    print(f"{cd_label}: Optimal PVA/CD Ratio = {
-          result['optimal_ratio']:.2f}, Predicted Robustness = {result['predicted_robustness']:.2f}")
+    print(f"{cd_label}: Optimal Composition -> PVA: 1, PEI: {result['optimal_pei_ratio']:.2f}, CD: {
+          result['optimal_cd_ratio']:.2f}, Predicted Robustness = {result['predicted_robustness']:.2f}")
 
-# Determine the overall best CD type and ratio based on predicted robustness.
+# Determine the overall best CD type and composition based on predicted robustness.
 best_cd_label, best_info = max(optimal_results.items(
 ), key=lambda item: item[1]['predicted_robustness'])
 print("\nFinal Optimal Composition:")
-print(f"CD Type: {
-      best_cd_label}, Optimal PVA/CD Ratio = {best_info['optimal_ratio']:.2f}")
+print(f"CD Type: {best_cd_label}, Composition: PVA=1, PEI={
+      best_info['optimal_pei_ratio']:.2f}, CD={best_info['optimal_cd_ratio']:.2f}")
 
 input("Enter to teminate...")
